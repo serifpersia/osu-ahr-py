@@ -26,15 +26,12 @@ A Python-based IRC bot designed to automate host rotation and beatmap checking i
     ```
 
 ## Installation
-
-	**Download:**
-
-	- Clone the repository or downlaod main branch zip
+Clone the repository or downlaod main branch zip
 	
-    ```bash
-    git clone https://github.com/serifpersia/osu-ahr-py.git
-    cd osu-ahr-py
-    ```
+```bash
+git clone https://github.com/serifpersia/osu-ahr-py.git
+cd osu-ahr-py
+ ```
 
  
 ## Configuration
