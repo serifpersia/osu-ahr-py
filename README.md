@@ -1,4 +1,4 @@
-# OsuIRCBot
+# osu-ahr-py
 
 A Python-based IRC bot designed to automate host rotation and beatmap checking in osu! multiplayer lobbies. This bot connects to the osu! IRC server, monitors the chat in a specified multiplayer room, and enforces rules defined in a configuration file.
 
