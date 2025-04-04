@@ -469,9 +469,9 @@ class OsuRoomBot(irc.client.SimpleIRCClient):
     def display_help_message(self):
         """Sends help information to the chat. Aim for 2-3 messages max."""
         messages = [
-            "Bot Help: !queue !skip !voteskip !rules !help",
-            "Host Only: !start [delay_seconds] !abort", # NEW commands added
-            # Maybe add brief rule summary if enabled? Keep it short.
+            "osu-ahr-py bot help: !queue !skip !voteskip !rules !help",
+            "Host Only: !start [delay_seconds] !abort",
+            "Bot creator: serifpersia : )",
         ]
         if self.config['map_checker']['enabled']:
              mc = self.config['map_checker']
