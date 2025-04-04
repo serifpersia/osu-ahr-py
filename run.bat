@@ -2,7 +2,7 @@
 ECHO Checking for Python...
 python --version >nul 2>&1
 IF %ERRORLEVEL% NEQ 0 (
-    ECHO Python not found. Please install Python 3.6+ from python.org and try again.
+    ECHO Python not found. Please install Python 3.7+ from python.org and try again.
     pause
     exit /b 1
 )
