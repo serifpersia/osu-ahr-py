@@ -20,6 +20,6 @@ ECHO Installing dependencies from requirements.txt...
 pip install -r requirements.txt
 
 ECHO Starting osu-ahr-py...
-python osu-ahr.py
+python osu-ahr-py.py
 
 pause

@@ -42,4 +42,4 @@ echo "Installing dependencies..."
 pip install -r requirements.txt
 
 echo "Starting osu-ahr-py..."
-$PYTHON_CMD osu-ahr.py
+$PYTHON_CMD osu-ahr-py.py
