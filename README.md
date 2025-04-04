@@ -77,8 +77,7 @@ cd osu-ahr-py
         *   `delay_seconds`: Delay after "All players ready" before sending `!mp start`.
     *   `auto_close_empty_room`: Settings for automatically closing the match.
         *   `enabled`: `true` or `false`.
-        *   `delay_seconds`: Timer for empty room before sending `!mp close`. 
-        *   
+        *   `delay_seconds`: Timer for empty room before sending `!mp close`.
 
     **Example `config.json`:**
     ```json
