@@ -1,6 +1,6 @@
 #!/bin/bash
 
-echo "Checking for Python 3.6+..."
+echo "Checking for Python 3.7+..."
 
 # Detect OS and set Python command accordingly
 if [[ "$OSTYPE" == "msys" || "$OSTYPE" == "cygwin" ]]; then
@@ -19,8 +19,8 @@ fi
 PYTHON_MAJOR=$($PYTHON_CMD -c "import sys; print(sys.version_info[0])")
 PYTHON_MINOR=$($PYTHON_CMD -c "import sys; print(sys.version_info[1])")
 
-if [[ $PYTHON_MAJOR -lt 3 || ($PYTHON_MAJOR -eq 3 && $PYTHON_MINOR -lt 6) ]]; then
-    echo "Error: Python version must be 3.6 or higher! Found: $PYTHON_MAJOR.$PYTHON_MINOR"
+if [[ $PYTHON_MAJOR -lt 3 || ($PYTHON_MAJOR -eq 3 && $PYTHON_MINOR -lt 7) ]]; then
+    echo "Error: Python version must be 3.7 or higher! Found: $PYTHON_MAJOR.$PYTHON_MINOR"
     exit 1
 fi
 
