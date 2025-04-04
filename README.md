@@ -78,44 +78,55 @@ cd osu-ahr-py
 
     **Example `config.json`:**
     ```json
-    {
-      "server": "irc.ppy.sh",
-      "port": 6667,
-      "username": "YourOsuUsername",
-      "password": "YourOsuIRCPassword",
-      "room_id": "123456789",
-      "welcome_message": "Bot connected. !help for commands. !rules for map rules.",
-      "goodbye_message": "Bot disconnecting.",
-      "osu_api_client_id": 1234,
-      "osu_api_client_secret": "YOUR_CLIENT_SECRET",
-      "map_checker": {
-        "enabled": true,
-        "min_stars": 4.0,
-        "max_stars": 7.0,
-        "min_length_seconds": 60,
-        "max_length_seconds": 300,
-        "violations_allowed": 3
-      },
-      "allowed_map_statuses": [ "ranked", "approved", "qualified", "loved" ],
-      "allowed_modes": [ "osu" ],
-      "host_rotation": {
-        "enabled": true
-      },
-      "vote_skip": {
-        "enabled": true,
-        "timeout_seconds": 60,
-        "threshold_type": "percentage",
-        "threshold_value": 51
-      },
-      "afk_handling": {
-        "enabled": true,
-        "timeout_seconds": 120
-      },
-      "auto_start": {
-        "enabled": false,
-        "delay_seconds": 5
-      }
-    }
+		{
+			"server": "irc.ppy.sh",
+			"port": 6667,
+			"username": "YourOsuUsername",
+			"password": "YourOsuIRCPassword",
+			"welcome_message": "Bot connected. !help for commands. !rules for map rules.",
+			"goodbye_message": "Bot disconnecting.",
+			"osu_api_client_id": 0,
+			"osu_api_client_secret": "YOUR_CLIENT_SECRET",
+			"map_checker": {
+				"enabled": true,
+				"min_stars": 0.0,
+				"max_stars": 10.0,
+				"min_length_seconds": 0,
+				"max_length_seconds": 0,
+				"violations_allowed": 3
+			},
+			"allowed_map_statuses": [
+				"ranked",
+				"approved",
+				"qualified",
+				"loved",
+				"graveyard"
+			],
+			"allowed_modes": [
+				"all"
+			],
+			"host_rotation": {
+				"enabled": true
+			},
+			"vote_skip": {
+				"enabled": true,
+				"timeout_seconds": 60,
+				"threshold_type": "percentage",
+				"threshold_value": 51
+			},
+			"afk_handling": {
+				"enabled": true,
+				"timeout_seconds": 120
+			},
+			"auto_start": {
+				"enabled": false,
+				"delay_seconds": 5
+			},
+			"auto_close_empty_room": {
+				"enabled": true,
+				"delay_seconds": 300
+			}
+	}
     ```
 
 ## Usage
