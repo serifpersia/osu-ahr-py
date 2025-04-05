@@ -13,8 +13,6 @@ A Python-based IRC bot designed to automate host rotation, beatmap checking, and
 *   **Admin Console:** Provides a command-line interface for administrators to control the bot, skip hosts, view the queue, and modify settings on the fly (changes are saved to `config.json`).
 *   **osu! API Integration:** Uses the osu! API v2 to fetch beatmap information for accurate and reliable map checking.
 *   **Configurable Rules:** Allows administrators to set specific criteria for allowed beatmaps and customize the bot's behavior extensively via `config.json`.
-*   **Event-Driven Architecture:** Utilizes a simple event emitter for potential extensibility.
-*   **Robust Error Handling:** Implements extensive logging and error handling to ensure stability and provide detailed diagnostics.
 *   **Cross-Platform Support:** Includes scripts for both Windows (`run.bat`) and Linux/macOS (`run.sh`) to simplify bot execution.
 
 ## Prerequisites
