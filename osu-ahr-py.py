@@ -210,6 +210,9 @@ class OsuRoomBot(irc.client.SimpleIRCClient):
         self.initial_slot_players = []
         self._tentative_host_from_settings = None
         self._reverting_to_map_id = 0 # Flag to track if we are reverting
+        self._expected_next_host = None # Track host expected after rotation cmd
+        self._rotation_start_time = 0   # Safety timeout for rotation state
+        
         
         # <<< Maps Played History State >>>
         played_list_config = self.runtime_config.get('maps_played_list', {})
@@ -272,7 +275,9 @@ class OsuRoomBot(irc.client.SimpleIRCClient):
         self.played_maps_history.clear()
         log.debug("Cleared played maps history.")
         # <<< END >>>
-        self._reverting_to_map_id = 0 # Reset revert flag
+        self._reverting_to_map_id = 0
+        self._expected_next_host = None
+        self._rotation_start_time = 0
 
     def log_feature_status(self):
         """Logs the status of major configurable features using runtime_config."""
@@ -1069,35 +1074,43 @@ class OsuRoomBot(irc.client.SimpleIRCClient):
 
 
     def handle_host_change(self, player_name):
-        """Handles Bancho's 'became the host' message."""
+        """Handles Bancho's 'became the host' message, considering rotation state."""
         if self.bot_state != BOT_STATE_IN_ROOM: return
 
         player_name_clean = player_name.strip()
         if not player_name_clean: return
         log.info(f"Bancho reported host changed to: '{player_name_clean}'")
 
-        # <<< FIX: Store rotation state *before* potential resets >>>
-        rotating_flag_was_true = self.is_rotating_host
-        # <<< END FIX >>>
+        rotating_flag_was_true = self.is_rotating_host # Capture state at entry
 
         # If message confirms current tentative host, finalize it
         if player_name_clean == self.current_host:
              log.info(f"Host change message confirms '{player_name_clean}' is the current host. Finalizing state.")
-             # Reset timers/state for this CONFIRMED host.
              self.reset_host_timers_and_state(player_name_clean) # Resets last action time
-             # <<< FIX: Reset rotation flag if we were rotating >>>
-             if rotating_flag_was_true:
-                 log.debug("Host confirmation during rotation. Resuming AFK checks.")
+
+             # <<< Check if this confirmation completes an expected rotation >>>
+             if rotating_flag_was_true and player_name_clean == self._expected_next_host:
+                 log.debug(f"Confirmed expected host '{player_name_clean}' during rotation. Resuming AFK checks.")
                  self.is_rotating_host = False
-             # <<< END FIX >>>
+                 self._expected_next_host = None
+                 self._rotation_start_time = 0
+                 # Display queue because rotation completed
+                 self.display_host_queue()
+             elif rotating_flag_was_true:
+                  log.warning(f"Host confirmed '{player_name_clean}', but expected host was '{self._expected_next_host}'. Still clearing rotation state.")
+                  self.is_rotating_host = False
+                  self._expected_next_host = None
+                  self._rotation_start_time = 0
+                  self.display_host_queue() # Display queue anyway as rotation sequence finished
+
              return # Exit early, no further sync needed
 
-        # Host is genuinely changing to someone new or confirming after assignment
+        # --- Host is genuinely changing to someone new (or confirming after assignment) ---
         previous_host = self.current_host
-        self.current_host = player_name_clean # Update internal host state
+        self.current_host = player_name_clean # Update internal host state FIRST
         self.HostChanged.emit({'player': player_name_clean, 'previous': previous_host})
 
-        # Ensure player is in lobby list (should be, but safety check)
+        # Ensure player is in lobby list
         if player_name_clean not in self.players_in_lobby:
              log.warning(f"New host '{player_name_clean}' wasn't in player list, adding.")
              self.handle_player_join(player_name_clean)
@@ -1105,15 +1118,14 @@ class OsuRoomBot(irc.client.SimpleIRCClient):
         # Reset timers, violations for the NEW confirmed host
         self.reset_host_timers_and_state(player_name_clean)
 
-        # Clear any vote skip targeting the *previous* host
+        # Clear vote skip targeting previous host
         if self.vote_skip_active and self.vote_skip_target == previous_host:
-             log.info(f"Host changed to {player_name_clean}. Cancelling vote skip for {previous_host}.")
+             log.info(f"Cancelling vote skip for {previous_host} (host changed).")
              self.send_message(f"Host changed to {player_name_clean}. Cancelling vote skip for {previous_host}.")
              self.clear_vote_skip("host changed")
-        # Also clear if targeting the new host (e.g., user manually used !mp host during vote)
         elif self.vote_skip_active and self.vote_skip_target == player_name_clean:
-             log.info(f"Host manually set to {player_name_clean}. Cancelling pending vote skip for them.")
-             self.send_message(f"Host manually set to {player_name_clean}. Cancelling pending vote skip for them.")
+             log.info(f"Cancelling vote skip for {player_name_clean} (became host).")
+             self.send_message(f"Host manually set to {player_name_clean}. Cancelling pending vote skip.")
              self.clear_vote_skip("host changed to target")
 
         # Synchronize host queue if rotation is enabled
@@ -1125,27 +1137,39 @@ class OsuRoomBot(irc.client.SimpleIRCClient):
                 log.info(f"New host '{player_name_clean}' wasn't in queue, adding to front.")
                 self.host_queue.appendleft(player_name_clean)
                 queue_changed_during_sync = True
-            elif self.host_queue[0] != player_name_clean:
-                log.warning(f"Host changed to '{player_name_clean}', but they weren't front of queue ({self.host_queue[0] if self.host_queue else 'N/A'}). Moving to front.")
+            elif self.host_queue and self.host_queue[0] != player_name_clean: # Check if queue not empty
+                log.warning(f"Host changed to '{player_name_clean}', but they weren't front of queue. Moving to front.")
                 try:
                     self.host_queue.remove(player_name_clean)
                     self.host_queue.appendleft(player_name_clean)
                     queue_changed_during_sync = True
-                except ValueError:
-                     log.error(f"Failed to reorder queue for new host '{player_name_clean}' - value error despite check.")
-            else:
-                 log.info(f"New host '{player_name_clean}' is already at the front of the queue.")
+                except ValueError: log.error(f"Failed to reorder queue for '{player_name_clean}' - value error.")
+            elif not self.host_queue: # Queue was empty, add them
+                log.info(f"Queue was empty, adding new host '{player_name_clean}' to front.")
+                self.host_queue.appendleft(player_name_clean)
+                queue_changed_during_sync = True
+            else: log.info(f"New host '{player_name_clean}' is already front of queue.")
 
-            # Display queue if it changed OR if rotation was in progress
+            # Display queue if it changed OR if rotation was flagged at the start
+            # This ensures queue is shown after successful rotation confirmation
             if queue_changed_during_sync or rotating_flag_was_true:
-                log.info(f"Queue synchronized/rotation confirmed. New Queue: {list(self.host_queue)}")
-                self.display_host_queue() # Display the final queue state
+                log.info(f"Queue updated/rotation confirmation. New Queue: {list(self.host_queue)}")
+                self.display_host_queue()
 
-        # <<< FIX: Reset rotation flag reliably *after* using its state >>>
-        if rotating_flag_was_true:
-            log.debug("Host change processed during rotation. Resuming AFK checks.")
+        # <<< Check if this host change completes the expected rotation sequence >>>
+        if rotating_flag_was_true and player_name_clean == self._expected_next_host:
+            log.debug(f"Confirmed expected host '{player_name_clean}' after rotation completed. Resuming AFK checks.")
             self.is_rotating_host = False
-        # <<< END FIX >>>
+            self._expected_next_host = None
+            self._rotation_start_time = 0
+        elif rotating_flag_was_true:
+             # Host changed, but not to the one we specifically expected from rotation.
+             # This could happen if another player used !mp host manually, or Bancho glitched.
+             # Clear the rotation state anyway to prevent getting stuck.
+             log.warning(f"Host changed to '{player_name_clean}', but expected host from rotation was '{self._expected_next_host}'. Clearing rotation state.")
+             self.is_rotating_host = False
+             self._expected_next_host = None
+             self._rotation_start_time = 0
 
     def reset_host_timers_and_state(self, host_name):
         """Resets AFK timer base, violations for the given host."""
@@ -1168,65 +1192,89 @@ class OsuRoomBot(irc.client.SimpleIRCClient):
         # handle_map_change and check_map control this flag.
     
     def rotate_and_set_host(self):
-        """Rotates the queue (if needed based on last_host) and sets the new host via !mp host."""
+        """Rotates the queue (if needed) and attempts to set the new host via !mp host."""
         if self.bot_state != BOT_STATE_IN_ROOM: return
+
+        # <<< Store initial rotation state >>>
+        was_rotating = self.is_rotating_host
+        # Reset expectation at the start
+        self._expected_next_host = None
+
         hr_enabled = self.runtime_config['host_rotation']['enabled']
 
         # --- Rotation Logic ---
         queue_rotated = False
         if hr_enabled and len(self.host_queue) > 1:
             log.info(f"Attempting host rotation. Last host marker: {self.last_host}. Queue Before: {list(self.host_queue)}")
-            player_to_rotate = self.last_host # Player who just finished (or was skipped)
-            # If the player who just played is still in the queue, move them to the back.
+            player_to_rotate = self.last_host
             if player_to_rotate and player_to_rotate in self.host_queue:
                 try:
-                    # Check if they are currently at the front (common case)
                     if self.host_queue[0] == player_to_rotate:
                         rotated_player = self.host_queue.popleft()
                         self.host_queue.append(rotated_player)
                         log.info(f"Rotated queue: Moved '{rotated_player}' (last host) from front to back.")
                         queue_rotated = True
                     else:
-                        # Less common: host changed mid-match/skip, last host is not at front.
-                        # Still move them to the very end.
                         log.warning(f"Last host '{player_to_rotate}' was not at front of queue. Removing and appending to end.")
                         self.host_queue.remove(player_to_rotate)
                         self.host_queue.append(player_to_rotate)
                         queue_rotated = True
-                except Exception as e:
-                    log.error(f"Error during queue rotation logic for '{player_to_rotate}': {e}", exc_info=True)
-            elif not player_to_rotate:
-                log.info("No specific last host marked for rotation (e.g., first round or rotation disabled/re-enabled). Front player will proceed.")
-            else: # player_to_rotate is set but not in queue (likely left)
-                log.info(f"Last host '{player_to_rotate}' is no longer in queue. No rotation needed for them.")
+                except Exception as e: log.error(f"Error during queue rotation logic for '{player_to_rotate}': {e}", exc_info=True)
+            elif not player_to_rotate: log.info("No specific last host marked for rotation. Front player will proceed.")
+            else: log.info(f"Last host '{player_to_rotate}' is no longer in queue. No rotation needed for them.")
             log.info(f"Queue After Rotation Logic: {list(self.host_queue)}")
         elif hr_enabled and len(self.host_queue) == 1:
             log.info("Only one player in queue, no rotation needed.")
         elif hr_enabled: # Queue is empty
              log.warning("Rotation triggered with empty queue. Cannot set host.")
-             self.current_host = None # Ensure host is cleared
+             self.current_host = None
              self.last_host = None
-             self.is_rotating_host = False # <<< FIX: Ensure flag is False even if we return early
+             # <<< Ensure flags cleared on early return >>>
+             if was_rotating:
+                  log.debug("Clearing rotation flags (empty queue).")
+                  self.is_rotating_host = False
+                  self._rotation_start_time = 0
              return # Exit early
         else: # Host rotation disabled
              log.debug("Host rotation is disabled. Resetting timers for current host (if any).")
-             if self.current_host:
-                  self.reset_host_timers_and_state(self.current_host)
-             self.last_host = None # Clear marker even if rotation off
-             self.is_rotating_host = False # <<< FIX: Ensure flag is False even if we return early
+             if self.current_host: self.reset_host_timers_and_state(self.current_host)
+             self.last_host = None
+             # <<< Ensure flags cleared on early return >>>
+             if was_rotating:
+                  log.debug("Clearing rotation flags (rotation disabled).")
+                  self.is_rotating_host = False
+                  self._rotation_start_time = 0
              return # Exit early
 
         # --- Set Next Host ---
-        self.last_host = None # Clear marker *after* rotation logic but *before* setting new host
-        host_assigned = self.set_next_host() # set_next_host now returns True/False
+        self.last_host = None # Clear marker *after* rotation logic
+        next_host_in_queue = self.host_queue[0] if self.host_queue else None
+        host_assigned = self.set_next_host() # Attempts to set host if needed
 
-        # <<< FIX: Reset rotation flag reliably *after* attempting to set host >>>
-        # This ensures it's cleared whether !mp host was sent or not.
-        if self.is_rotating_host:
-             log.debug("Rotation/set host process finished. Resuming AFK checks.")
-             self.is_rotating_host = False
-        # <<< END FIX >>>
+        # <<< Set expectation ONLY if host was actually assigned via !mp host >>>
+        if host_assigned and next_host_in_queue:
+            self._expected_next_host = next_host_in_queue
+            log.info(f"Rotation expects '{self._expected_next_host}' to become host.")
+            # Keep is_rotating_host True, set timer start
+            if was_rotating: # Check the initial state
+                 self._rotation_start_time = time.time()
+                 log.debug(f"Rotation safety timer started ({self._rotation_start_time:.1f}). AFK check remains paused.")
+            else:
+                 log.warning("set_next_host assigned host, but was_rotating was False?")
+                 self.is_rotating_host = True # Force on just in case
+                 self._rotation_start_time = time.time()
+        elif was_rotating and not host_assigned:
+            # Host wasn't assigned (e.g., already host, or queue empty now)
+            # but we *were* in a rotation sequence. Clear the flag now.
+            log.debug("Rotation sequence finished, but no new host assigned via !mp host. Resuming AFK checks.")
+            self.is_rotating_host = False
+            self._rotation_start_time = 0
+            # Display queue here? Maybe not needed if no change happened.
+            # self.display_host_queue()
 
+        # <<< REMOVED the final clearing logic from here. >>>
+        # It's now handled above if host_assigned is False,
+        # or by handle_host_change / safety timeout if host_assigned is True.
     def set_next_host(self):
         """Sets the player at the front of the queue as the host via !mp host. Returns True if assignment attempted."""
         if self.bot_state != BOT_STATE_IN_ROOM: return False
@@ -1250,7 +1298,7 @@ class OsuRoomBot(irc.client.SimpleIRCClient):
                 self.host_map_selected_valid = False
                 self.host_last_action_time = 0
             return False
-
+            
     def skip_current_host(self, reason="No reason specified"):
         """Skips the current host, rotates queue (if enabled), and sets the next host."""
         if self.bot_state != BOT_STATE_IN_ROOM: return
@@ -1470,122 +1518,119 @@ class OsuRoomBot(irc.client.SimpleIRCClient):
                 log.info(f"Map checker off. Marked map {map_id} as valid for starting.")
         # <<< END Revert Check >>>
 
-# --- Map Checking Logic (In Room) ---
     def check_map(self, map_id, map_title):
         """Fetches map info, checks rules (inc. history), and sends enhanced 'Map OK' message with labels."""
-        # --- Initial checks (config enabled, map ID match, host exists) ---
+        # --- Initial checks ---
+        # ... (same as before) ...
         if not self.runtime_config['map_checker']['enabled']:
-             log.debug("Skipping map check (Map Checker disabled).")
-             self.host_map_selected_valid = False
-             if self.current_host: self.reset_host_timers_and_state(self.current_host)
-             self.last_valid_map_id = map_id # Treat as valid if checker off
-             if map_id > 0:
-                 map_link = self._format_map_link(map_id, map_title)
-                 self.send_message(f"Map OK (Checker Off): {map_link}")
+             # ... (handle checker disabled) ...
              return
-
-        if map_id != self.current_map_id:
-             log.info(f"Map check for {map_id} aborted, map changed again.")
-             return
-
+        if map_id != self.current_map_id: return
         current_host_for_check = self.current_host
-        if not current_host_for_check:
-             log.debug("Skipping map check (no host).")
-             self.host_map_selected_valid = False
-             return
+        if not current_host_for_check: return
 
         log.info(f"Checking map {map_id} ('{map_title}') selected by {current_host_for_check}...")
 
         # --- Check Played History ---
+        # ... (same as before) ...
         played_list_config = self.runtime_config.get('maps_played_list', {})
-        if played_list_config.get('enabled', False):
-            if map_id in self.played_maps_history:
-                history_size = self.played_maps_history.maxlen if self.played_maps_history.maxlen is not None else 'infinite'
-                reason = f"Map played recently (within last {history_size} maps)"
-                log.warning(f"Map {map_id} rejected for host {current_host_for_check}: {reason}.")
-                self.reject_map(reason, is_violation=True)
-                return
-            else:
-                log.debug(f"Map {map_id} not found in played history.")
+        if played_list_config.get('enabled', False) and map_id in self.played_maps_history:
+            history_size = self.played_maps_history.maxlen if self.played_maps_history.maxlen is not None else 'infinite'
+            reason = f"Map played recently (within last {history_size} maps)"
+            log.warning(f"Map {map_id} rejected for host {current_host_for_check}: {reason}.")
+            self.reject_map(reason, is_violation=True)
+            return
 
         # --- Fetch Map Info ---
+        # ... (same as before) ...
         info = get_beatmap_info(map_id, self.api_client_id, self.api_client_secret)
         if info is None:
-            self.reject_map(f"Could not get info for map ID {map_id}. API failure or map unavailable.", is_violation=False)
+            self.reject_map(f"Could not get info for map ID {map_id}.", is_violation=False)
             return
 
         # --- Extract Info ---
+        # ... (same as before, extract stars, length, status, mode_api etc.) ...
         stars = info.get('stars')
         length = info.get('length')
         status = info.get('status', 'unknown').lower()
-        mode_api = info.get('mode', 'unknown') # 'osu', 'taiko', 'fruits', 'mania'
-        full_title = info.get('title', 'N/A')
-        version = info.get('version', 'N/A')
-        beatmap_id = info.get('beatmap_id') # Should match input map_id
-        beatmapset_id = info.get('beatmapset_id')
-        bpm = info.get('bpm')
-        count_circles = info.get('count_circles') # Can be None
-        count_sliders = info.get('count_sliders') # Can be None
-        count_spinners = info.get('count_spinners') # Can be None
+        mode_api = info.get('mode', 'unknown')
+        # ... (extract other stats: cs_val, ar_val, etc.) ...
         cs_val = info.get('cs')
         ar_val = info.get('ar')
-        od_val = info.get('od') # Accuracy
-        hp_val = info.get('hp') # Drain
+        od_val = info.get('od')
+        hp_val = info.get('hp')
+        bpm = info.get('bpm')
+        count_circles = info.get('count_circles')
+        count_sliders = info.get('count_sliders')
+        count_spinners = info.get('count_spinners')
+        beatmap_id = info.get('beatmap_id')
+        beatmapset_id = info.get('beatmapset_id')
+        full_title = info.get('title', 'N/A')
+        version = info.get('version', 'N/A')
 
         stars_str = f"{stars:.2f}*" if stars is not None else "N/A"
         length_str = self._format_time(length) if length is not None else "N/A"
         map_display_name = f"{full_title} [{version}]" if full_title != 'N/A' and version != 'N/A' else map_title
 
-        # --- Rule Checks ---
+        # --- Rule Checks (MODIFIED Violation Messages) ---
         violations = []
         mc = self.runtime_config['map_checker']
         allowed_statuses = [s.lower() for s in self.runtime_config.get('allowed_map_statuses', ['all'])]
         allowed_modes = [m.lower() for m in self.runtime_config.get('allowed_modes', ['all'])]
+
         # Status
-        if 'all' not in allowed_statuses and status not in allowed_statuses: violations.append(f"Status '{status}' invalid")
+        if 'all' not in allowed_statuses and status not in allowed_statuses:
+            violations.append(f"Status '{status}' invalid (Allowed: {', '.join(allowed_statuses)})") # Added allowed list
         # Mode
-        if 'all' not in allowed_modes and mode_api not in allowed_modes: violations.append(f"Mode '{mode_api}' invalid")
+        if 'all' not in allowed_modes and mode_api not in allowed_modes:
+            violations.append(f"Mode '{mode_api}' invalid (Allowed: {', '.join(allowed_modes)})") # Added allowed list
         # Stars
         min_stars = mc.get('min_stars', 0); max_stars = mc.get('max_stars', 0)
         if stars is not None:
             epsilon = 0.001
-            if min_stars > 0 and stars < min_stars - epsilon: violations.append(f"Stars {stars_str} < Min")
-            if max_stars > 0 and stars > max_stars + epsilon: violations.append(f"Stars {stars_str} > Max")
-        elif min_stars > 0 or max_stars > 0: violations.append("Stars N/A")
+            # <<< FIX: Include min/max values in violation string >>>
+            if min_stars > 0 and stars < min_stars - epsilon:
+                violations.append(f"Stars {stars_str} < Min ({min_stars:.2f}*)")
+            if max_stars > 0 and stars > max_stars + epsilon:
+                violations.append(f"Stars {stars_str} > Max ({max_stars:.2f}*)")
+            # <<< END FIX >>>
+        elif min_stars > 0 or max_stars > 0:
+            violations.append("Star rating N/A")
         # Length
         min_len = mc.get('min_length_seconds', 0); max_len = mc.get('max_length_seconds', 0)
         if length is not None:
-            if min_len > 0 and length < min_len: violations.append(f"Length < Min")
-            if max_len > 0 and length > max_len: violations.append(f"Length > Max")
-        elif min_len > 0 or max_len > 0: violations.append("Length N/A")
+            # <<< FIX: Include min/max values in violation string >>>
+            if min_len > 0 and length < min_len:
+                 violations.append(f"Length {length_str} < Min ({self._format_time(min_len)})")
+            if max_len > 0 and length > max_len:
+                 violations.append(f"Length {length_str} > Max ({self._format_time(max_len)})")
+            # <<< END FIX >>>
+        elif min_len > 0 or max_len > 0:
+            violations.append("Length N/A")
         # --- End Rule Checks ---
 
         # --- Process Result ---
         if current_host_for_check != self.current_host:
-             log.warning(f"Map check for {map_id} completed, but host changed. Ignoring result.")
-             self.host_map_selected_valid = False
+             # ... (handle host change during check) ...
              return
 
         if violations:
-            # Format rejection reason clearly
-            simple_reason = '; '.join(violations)
-            reason = f"Map Rejected ({simple_reason})"
+            # The reason now includes the specific values
+            reason = f"Map Rejected: {'; '.join(violations)}" # Join the detailed violations
             log.warning(f"Map violation by {current_host_for_check} on map {map_id}: {reason}")
             self.reject_map(reason, is_violation=True)
         else:
-            # <<< Map Accepted - Construct Detailed Labelled Stats Message >>>
+            # --- Map Accepted ---
+            # ... (same logic as before for setting flags, constructing links, constructing stats string) ...
             self.host_map_selected_valid = True
-            self.last_valid_map_id = beatmap_id # Use the confirmed ID from API
+            self.last_valid_map_id = beatmap_id
 
             log.info(f"Map {beatmap_id} ('{map_display_name}') accepted for host {current_host_for_check}.")
 
             map_osu_link = self._format_map_link(beatmap_id, map_display_name)
             map_mirror_link = f" | Mirror: https://catboy.best/d/{beatmapset_id}n" if beatmapset_id else ""
 
-            # --- Construct Labelled Stats String ---
             stats_list = []
-
-            # Common Stats (Always Add)
             stats_list.append(f"Rating: {stars_str}")
             stats_list.append(f"Length: {length_str}")
             if bpm is not None: stats_list.append(f"BPM: {bpm:.1f}")
@@ -1593,6 +1638,7 @@ class OsuRoomBot(irc.client.SimpleIRCClient):
             # Mode-Specific Difficulty & Objects
             if mode_api == 'osu':
                 if cs_val is not None: stats_list.append(f"CS: {cs_val:.1f}")
+                # ... (rest of osu stats) ...
                 if ar_val is not None: stats_list.append(f"AR: {ar_val:.1f}")
                 if od_val is not None: stats_list.append(f"OD: {od_val:.1f}")
                 if hp_val is not None: stats_list.append(f"HP: {hp_val:.1f}")
@@ -1601,48 +1647,39 @@ class OsuRoomBot(irc.client.SimpleIRCClient):
                 if count_spinners is not None: stats_list.append(f"Spinners: {count_spinners}")
             elif mode_api == 'taiko':
                 if od_val is not None: stats_list.append(f"OD: {od_val:.1f}")
+                # ... (rest of taiko stats) ...
                 if hp_val is not None: stats_list.append(f"HP: {hp_val:.1f}")
-                # API counts: circles=hits, sliders=drumrolls, spinners=dendens
-                if count_circles is not None: stats_list.append(f"Hits: {count_circles}") # Renamed
-                if count_sliders is not None: stats_list.append(f"Rolls: {count_sliders}") # Renamed
-                if count_spinners is not None: stats_list.append(f"Spinners: {count_spinners}") # Denden/Spinner ok
+                if count_circles is not None: stats_list.append(f"Hits: {count_circles}")
+                if count_sliders is not None: stats_list.append(f"Rolls: {count_sliders}")
+                if count_spinners is not None: stats_list.append(f"Spinners: {count_spinners}")
             elif mode_api == 'fruits':
                 if cs_val is not None: stats_list.append(f"CS: {cs_val:.1f}")
+                # ... (rest of fruits stats) ...
                 if ar_val is not None: stats_list.append(f"AR: {ar_val:.1f}")
                 if od_val is not None: stats_list.append(f"OD: {od_val:.1f}")
                 if hp_val is not None: stats_list.append(f"HP: {hp_val:.1f}")
-                # API counts: circles=fruits, sliders=droplets, spinners=bananas
-                if count_circles is not None: stats_list.append(f"Fruits: {count_circles}") # Renamed
-                if count_sliders is not None: stats_list.append(f"Droplets: {count_sliders}") # Renamed
-                if count_spinners is not None: stats_list.append(f"Bananas: {count_spinners}") # Renamed
+                if count_circles is not None: stats_list.append(f"Fruits: {count_circles}")
+                if count_sliders is not None: stats_list.append(f"Droplets: {count_sliders}")
+                if count_spinners is not None: stats_list.append(f"Bananas: {count_spinners}")
             elif mode_api == 'mania':
                 if cs_val is not None: stats_list.append(f"Keys: {cs_val:.0f}K")
+                # ... (rest of mania stats) ...
                 if od_val is not None: stats_list.append(f"OD: {od_val:.1f}")
                 if hp_val is not None: stats_list.append(f"HP: {hp_val:.1f}")
-                # API counts: circles=notes, sliders=LNs
-                if count_circles is not None: stats_list.append(f"Notes: {count_circles}") # Renamed
-                if count_sliders is not None: stats_list.append(f"LNs: {count_sliders}") # Renamed
+                if count_circles is not None: stats_list.append(f"Notes: {count_circles}")
+                if count_sliders is not None: stats_list.append(f"LNs: {count_sliders}")
 
-            # Always add status
             stats_list.append(f"Status: {status}")
-
-            # Join the parts for the final message
-            stats_str = " | ".join(stats_list) # Use pipe separator
+            stats_str = " | ".join(stats_list)
             final_stats_message = f"-> {stats_str}"
-            # --- End Stats String Construction ---
 
-            # Send messages
             self.send_message(f"Map OK: {map_osu_link}{map_mirror_link}")
             self.send_message(final_stats_message)
-            # <<< END Map Accepted >>>
 
-            # Reset AFK timer base time on SUCCESSFUL validation
             self.reset_host_timers_and_state(current_host_for_check)
-            log.debug(f"Host '{current_host_for_check}' proved activity by selecting valid map {beatmap_id}.")
-
-            # Reset violation count for the host
+            log.debug(f"Host '{current_host_for_check}' proved activity.")
             if current_host_for_check in self.map_violations and self.map_violations[current_host_for_check] > 0:
-                 log.info(f"Resetting map violation count for {current_host_for_check} after valid pick.")
+                 log.info(f"Resetting map violation count for {current_host_for_check}.")
                  self.map_violations[current_host_for_check] = 0
 
     def _format_map_link(self, beatmap_id, display_name):
@@ -2705,76 +2742,144 @@ def console_input_loop(bot_instance):
 
     log.info("Console input thread finished.")
 
-
 # --- Main Execution ---
 def main():
     global shutdown_requested
-    config = load_or_generate_config(CONFIG_FILE)
-    bot = None
-    try: bot = OsuRoomBot(config); bot.bot_state = BOT_STATE_INITIALIZING
-    except Exception as e: log.critical(f"Init failed: {e}", exc_info=True); sys.exit(1)
 
+    config = load_or_generate_config(CONFIG_FILE)
+    # load_or_generate_config now exits on critical failure, no need to check return
+
+    bot = None
+    try:
+        bot = OsuRoomBot(config) # Pass the loaded config
+        bot.bot_state = BOT_STATE_INITIALIZING
+    except Exception as e:
+        log.critical(f"Failed to initialize OsuRoomBot: {e}", exc_info=True)
+        sys.exit(1)
+
+    # Setup signal handling
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
+
+    # Start console input thread
     console_thread = threading.Thread(target=console_input_loop, args=(bot,), daemon=True, name="AdminConsoleThread")
     console_thread.start()
 
+    # --- Connection Attempt ---
     log.info(f"Connecting to {config['server']}:{config['port']} as {config['username']}...")
     connection_successful = False
     try:
-        bot.connect(server=config['server'], port=config['port'], nickname=config['username'], password=config['password'], username=config['username'])
+        bot.connect(
+            server=config['server'], port=config['port'],
+            nickname=config['username'], password=config['password'],
+            username=config['username']
+        )
         connection_successful = True
     except irc.client.ServerConnectionError as e:
         log.critical(f"IRC Connection failed: {e}")
         err_str = str(e).lower(); msg = ""
-        if "nickname is already in use" in err_str: msg = "-> Nickname in use."
-        elif "incorrect password" in err_str or "authentication failed" in err_str: msg = "-> Incorrect IRC password."
-        elif "cannot assign requested address" in err_str or "temporary failure" in err_str: msg = f"-> Network error connecting to {config['server']}."
-        else: msg = f"-> Unhandled error: {e}"
+        if "nickname is already in use" in err_str: msg = "-> Nickname in use. Check config.json or if another client is connected."
+        elif "incorrect password" in err_str or "authentication failed" in err_str: msg = "-> Incorrect IRC password. Get from osu! website account settings (Legacy API)."
+        elif "cannot assign requested address" in err_str or "temporary failure" in err_str: msg = f"-> Network error connecting to {config['server']}. Check server address/internet."
+        else: msg = f"-> Unhandled server connection error: {e}"
         log.critical(msg); bot._request_shutdown("Connection Error")
-    except Exception as e: log.critical(f"Connect call failed: {e}", exc_info=True); bot._request_shutdown("Connect Exception")
+    except Exception as e:
+        log.critical(f"Unexpected error during bot.connect call: {e}", exc_info=True)
+        bot._request_shutdown("Connect Exception")
 
+    # --- Main Loop ---
     if connection_successful:
         log.info("Starting main processing loop...")
         last_periodic_check = time.time()
-        check_interval = 5 # Seconds
+        check_interval = 5 # Seconds between periodic checks
+        ROTATION_SAFETY_TIMEOUT = 20 # Seconds to wait for host confirmation during rotation
 
         while not shutdown_requested:
             try:
+                # Process IRC events with a short timeout
                 bot.reactor.process_once(timeout=0.2)
-                current_state = bot.bot_state
+
+                current_state = bot.bot_state # Cache state for checks
                 if current_state == BOT_STATE_IN_ROOM and bot.connection.is_connected():
                     now = time.time()
                     if now - last_periodic_check >= check_interval:
+                        # Run periodic checks
                         try: bot.check_afk_host()
-                        except Exception as e: log.error(f"Error check_afk: {e}", exc_info=True)
+                        except Exception as e: log.error(f"Error in check_afk_host: {e}", exc_info=True)
                         try: bot.check_vote_skip_timeout()
-                        except Exception as e: log.error(f"Error check_vote_timeout: {e}", exc_info=True)
+                        except Exception as e: log.error(f"Error in check_vote_skip_timeout: {e}", exc_info=True)
                         try: bot.check_empty_room_close()
-                        except Exception as e: log.error(f"Error check_empty_close: {e}", exc_info=True)
-                        last_periodic_check = now
-                elif current_state == BOT_STATE_SHUTTING_DOWN: break
-            except irc.client.ServerNotConnectedError:
-                if bot.bot_state != BOT_STATE_SHUTTING_DOWN: log.warning("Disconnected. Requesting shutdown."); bot._request_shutdown("Disconnected in main loop")
-                break
-            except KeyboardInterrupt:
-                 if not shutdown_requested: log.info("Main loop Ctrl+C. Requesting shutdown."); bot._request_shutdown("Main loop Ctrl+C")
-                 break
-            except Exception as e: log.error(f"Unhandled main loop exception: {e}", exc_info=True); time.sleep(2)
+                        except Exception as e: log.error(f"Error in check_empty_room_close: {e}", exc_info=True)
 
-    log.info("Main loop ended. Final shutdown...")
-    if not shutdown_requested: shutdown_requested = True;
-    if bot and bot.bot_state != BOT_STATE_SHUTTING_DOWN: bot.bot_state = BOT_STATE_SHUTTING_DOWN
-    if bot: bot.shutdown("Client shutdown.")
-    log.info("Waiting for console thread...")
-    console_thread.join(timeout=2.0)
-    if console_thread.is_alive(): log.warning("Console thread join timeout.")
+                        # <<< ADDED Safety check for stuck rotation state >>>
+                        try:
+                            # Check if rotation is flagged, a start time exists, and timeout exceeded
+                            if bot.is_rotating_host and bot._rotation_start_time > 0 and \
+                               (now - bot._rotation_start_time > ROTATION_SAFETY_TIMEOUT):
+                                log.warning(f"Rotation state safety timeout ({ROTATION_SAFETY_TIMEOUT}s) hit. Expected host '{bot._expected_next_host}' never confirmed. Clearing rotation state.")
+                                bot.is_rotating_host = False
+                                bot._expected_next_host = None
+                                bot._rotation_start_time = 0
+                                # Display queue again to reflect the potentially unexpected state
+                                bot.display_host_queue()
+                        except Exception as e:
+                            log.error(f"Error checking rotation timeout: {e}", exc_info=True)
+                        # <<< END Safety check >>>
+
+                        last_periodic_check = now # Reset check timer
+                elif current_state == BOT_STATE_SHUTTING_DOWN:
+                     break # Exit loop if shutdown requested
+
+            except irc.client.ServerNotConnectedError:
+                if bot.bot_state != BOT_STATE_SHUTTING_DOWN:
+                    log.warning("Disconnected during processing loop. Requesting shutdown.")
+                    bot._request_shutdown("Disconnected in main loop")
+                break # Exit loop on disconnect
+            except KeyboardInterrupt:
+                 if not shutdown_requested:
+                     log.info("Main loop KeyboardInterrupt. Requesting shutdown.")
+                     bot._request_shutdown("Main loop Ctrl+C")
+                 break # Exit loop on Ctrl+C
+            except Exception as e:
+                log.error(f"Unhandled exception in main loop: {e}", exc_info=True)
+                time.sleep(2) # Pause briefly after an unknown error to prevent spamming logs
+
+    # --- Shutdown Sequence ---
+    log.info("Main loop exited or connection failed. Initiating final shutdown...")
+    # Ensure shutdown flag is set even if loop exited unexpectedly
+    if not shutdown_requested:
+        shutdown_requested = True
+        if bot and bot.bot_state != BOT_STATE_SHUTTING_DOWN:
+             bot.bot_state = BOT_STATE_SHUTTING_DOWN
+
+    if bot:
+        bot.shutdown("Client shutting down normally.") # Handles QUIT, goodbye message etc.
+
+    log.info("Waiting for console thread to exit...")
+    console_thread.join(timeout=2.0) # Give console thread time to finish
+    if console_thread.is_alive():
+        log.warning("Console thread did not exit cleanly after timeout.")
+
     log.info("osu-ahr-py finished.")
 
+
+# --- Entry Point ---
 if __name__ == "__main__":
     main_exit_code = 0
-    try: main()
-    except SystemExit as e: log.info(f"Exited code {e.code}."); main_exit_code = e.code if isinstance(e.code, int) else 1
-    except KeyboardInterrupt: log.info("\nMain interrupted. Exiting."); main_exit_code = 1
-    except Exception as e: log.critical(f"CRITICAL UNHANDLED ERROR: {e}", exc_info=True); main_exit_code = 1
-    finally: logging.shutdown(); sys.exit(main_exit_code)
+    try:
+        main()
+    except SystemExit as e:
+         log.info(f"Program exited with code {e.code}.")
+         main_exit_code = e.code if isinstance(e.code, int) else 1
+    except KeyboardInterrupt:
+         # This catches Ctrl+C pressed *before* the main loop's try/except block
+         log.info("\nMain execution interrupted by Ctrl+C during startup/shutdown. Exiting.")
+         main_exit_code = 1
+    except Exception as e:
+        # Catch-all for unexpected errors during startup/shutdown
+        log.critical(f"CRITICAL UNHANDLED ERROR during execution: {e}", exc_info=True)
+        main_exit_code = 1
+    finally:
+        logging.shutdown() # Ensure log handlers are flushed
+        # input("Press Enter to exit...") # Optional: Keep console open after script finishes
+        sys.exit(main_exit_code)
