@@ -212,7 +212,7 @@ class OsuRoomBot(irc.client.SimpleIRCClient):
         self._reverting_to_map_id = 0 # Flag to track if we are reverting
         self._expected_next_host = None # Track host expected after rotation cmd
         self._rotation_start_time = 0   # Safety timeout for rotation state
-        
+        self._pending_host_after_match = None # Stores username if host left 
         
         # <<< Maps Played History State >>>
         played_list_config = self.runtime_config.get('maps_played_list', {})
@@ -278,6 +278,7 @@ class OsuRoomBot(irc.client.SimpleIRCClient):
         self._reverting_to_map_id = 0
         self._expected_next_host = None
         self._rotation_start_time = 0
+        self._pending_host_after_match = None # Reset this too
 
     def log_feature_status(self):
         """Logs the status of major configurable features using runtime_config."""
@@ -1019,46 +1020,96 @@ class OsuRoomBot(irc.client.SimpleIRCClient):
         if self.bot_state != BOT_STATE_IN_ROOM: return
         player_name_clean = player_name.strip()
         if not player_name_clean: return
+
         log.info(f"Processing player left/kick: '{player_name_clean}'")
         was_in_lobby = player_name_clean in self.players_in_lobby
         was_host = (player_name_clean == self.current_host)
         was_last_host = (player_name_clean == self.last_host)
+
         if was_in_lobby:
             self.players_in_lobby.remove(player_name_clean)
             log.info(f"'{player_name_clean}' left/kicked. Lobby size: {len(self.players_in_lobby)}")
             self.PlayerLeft.emit({'player': player_name_clean})
-        else: log.warning(f"'{player_name_clean}' left/kicked but was not in tracked player list?")
+        else:
+            log.warning(f"'{player_name_clean}' left/kicked but was not in tracked player list?")
+
         hr_enabled = self.runtime_config['host_rotation']['enabled']
         queue_changed = False
+        intended_next_host_after_leave = None
+
         if hr_enabled:
+            # Check who *would* be next *before* removing the player if they were host
+            if was_host and len(self.host_queue) > 1:
+                 original_queue = list(self.host_queue)
+                 try:
+                     current_index = original_queue.index(player_name_clean)
+                     next_index = (current_index + 1) % len(original_queue)
+                     # Ensure the next person isn't the person leaving (only relevant if queue has only 2 people)
+                     if original_queue[next_index] != player_name_clean:
+                         intended_next_host_after_leave = original_queue[next_index]
+                 except ValueError:
+                     log.warning(f"Host '{player_name_clean}' left but wasn't found in queue {original_queue} during next host check.")
+
             if player_name_clean in self.host_queue:
                 try:
                     self.host_queue.remove(player_name_clean)
                     log.info(f"Removed '{player_name_clean}' from queue. New Queue: {list(self.host_queue)}")
                     queue_changed = True
-                except ValueError: log.warning(f"'{player_name_clean}' was not found in queue for removal despite check?")
-            else: log.warning(f"'{player_name_clean}' left but not found in queue?")
+                except ValueError:
+                    log.warning(f"'{player_name_clean}' was not found in queue for removal despite check?")
+            else:
+                 # Only warn if they were previously in the lobby; prevents warnings for players leaving before init
+                 if was_in_lobby:
+                     log.warning(f"'{player_name_clean}' left but not found in queue (Rotation Enabled)? Queue: {list(self.host_queue)}")
+
             if was_last_host:
                 log.info(f"Player '{player_name_clean}' who was marked as last_host left. Clearing marker.")
                 self.last_host = None
+
         if player_name_clean in self.map_violations:
             del self.map_violations[player_name_clean]
             log.debug(f"Removed violation count for leaving player '{player_name_clean}'.")
+
         self.clear_vote_skip_if_involved(player_name_clean, "player left/kicked")
-        next_host_assigned = False
+
+        # --- Host Left Logic ---
         if was_host:
-            log.info(f"Host '{player_name_clean}' left.")
-            self.current_host = None
+            log.warning(f"Host '{player_name_clean}' left.")
+            original_host = self.current_host
+            self.current_host = None # Clear internal host tracking
             self.host_map_selected_valid = False
-            self.host_last_action_time = 0
-            if hr_enabled and not self.is_matching and self.host_queue:
-                log.info("Host left outside match, attempting to set next host.")
+            self.host_last_action_time = 0 # Clear timer base
+
+            # --- MID-MATCH HOST LEAVE SCENARIO ---
+            if self.is_matching:
+                log.warning(f"Host '{original_host}' left *during* the match!")
+                if hr_enabled:
+                    # Determine the intended next host from the updated queue
+                    self._pending_host_after_match = self.host_queue[0] if self.host_queue else None
+                    if self._pending_host_after_match:
+                         log.info(f"Match ongoing. Marking '{self._pending_host_after_match}' as the intended host after match finishes.")
+                    else:
+                         log.info("Match ongoing. Queue is empty, no host to assign after match.")
+                    # Pause AFK timer for whoever Bancho assigns host to temporarily
+                    self.is_rotating_host = True
+                    log.info("AFK timer paused until match ends and correct host is assigned.")
+                else: # Rotation disabled
+                    log.info("Host left mid-match (rotation disabled). No host will be assigned automatically after.")
+                    self._pending_host_after_match = None # Ensure flag is clear
+            # --- HOST LEAVE *OUTSIDE* MATCH ---
+            elif hr_enabled and not self.is_matching:
+                log.info("Host left outside match, attempting to set next host from queue.")
+                # Setting next host will also set is_rotating_host = True temporarily
                 self.set_next_host()
-                next_host_assigned = True
-            elif not hr_enabled: log.info("Host left (rotation disabled). Host cleared.")
-            elif hr_enabled and not self.host_queue: log.info("Host left, queue is now empty. No host to assign.")
-        log.debug(f"Skipping queue display after player left (queue_changed={queue_changed}, next_host_assigned={next_host_assigned})")
+            elif not hr_enabled:
+                log.info("Host left (rotation disabled). Host cleared.")
+
+        # Check if room becomes empty only *after* processing the leave fully
         self._check_start_empty_room_timer()
+        # Only display queue if rotation is on and a host change happened outside a match or queue changed
+        # Avoid displaying queue if host left mid-match (wait for post-match correction)
+        #if hr_enabled and queue_changed and not (was_host and self.is_matching):
+        #    self.display_host_queue()
 
     def _check_start_empty_room_timer(self):
         """Checks if the room is empty and starts the auto-close timer if applicable."""
@@ -1073,53 +1124,68 @@ class OsuRoomBot(irc.client.SimpleIRCClient):
             self.empty_room_timestamp = time.time()
 
 
+# --- Modify handle_host_change ---
     def handle_host_change(self, player_name):
-        """Handles Bancho's 'became the host' message, considering rotation state."""
+        """Handles Bancho's 'became the host' message, checking against queue if rotation enabled."""
         if self.bot_state != BOT_STATE_IN_ROOM: return
 
         player_name_clean = player_name.strip()
         if not player_name_clean: return
         log.info(f"Bancho reported host changed to: '{player_name_clean}'")
 
-        rotating_flag_was_true = self.is_rotating_host # Capture state at entry
+        # Store previous state for checks/logging
+        previous_host = self.current_host
+        rotating_flag_was_true = self.is_rotating_host
+        expected_host_at_entry = self._expected_next_host
 
-        # If message confirms current tentative host, finalize it
-        if player_name_clean == self.current_host:
-             log.info(f"Host change message confirms '{player_name_clean}' is the current host. Finalizing state.")
-             self.reset_host_timers_and_state(player_name_clean) # Resets last action time
-
-             # <<< Check if this confirmation completes an expected rotation >>>
-             if rotating_flag_was_true and player_name_clean == self._expected_next_host:
-                 log.debug(f"Confirmed expected host '{player_name_clean}' during rotation. Resuming AFK checks.")
-                 self.is_rotating_host = False
-                 self._expected_next_host = None
-                 self._rotation_start_time = 0
-                 # Display queue because rotation completed
+        # --- Check 1: Is this the host we expected from rotation/correction? ---
+        if rotating_flag_was_true and player_name_clean == expected_host_at_entry:
+            log.info(f"Host change confirms expected host '{player_name_clean}'. Finalizing state.")
+            self.current_host = player_name_clean # Update internal host
+            self.HostChanged.emit({'player': player_name_clean, 'previous': previous_host})
+            if player_name_clean not in self.players_in_lobby: # Should be rare here
+                 log.warning(f"Expected host '{player_name_clean}' wasn't in player list? Adding.")
+                 self.handle_player_join(player_name_clean)
+            self.reset_host_timers_and_state(player_name_clean) # Reset timers for confirmed host
+            # Clear rotation state as it completed successfully
+            self.is_rotating_host = False
+            self._expected_next_host = None
+            self._rotation_start_time = 0
+            log.debug("Rotation sequence successfully completed. Resuming AFK checks.")
+            # Display queue to show the new confirmed host
+            if self.runtime_config['host_rotation']['enabled']:
                  self.display_host_queue()
-             elif rotating_flag_was_true:
-                  log.warning(f"Host confirmed '{player_name_clean}', but expected host was '{self._expected_next_host}'. Still clearing rotation state.")
+            return # Successful confirmation, exit early
+
+        # --- Check 2: Is this the *current* host just being re-confirmed? ---
+        # (e.g., !mp host PlayerA when PlayerA is already host)
+        if player_name_clean == self.current_host:
+             log.info(f"Host change message re-confirms '{player_name_clean}' is the current host. Resetting timers.")
+             self.reset_host_timers_and_state(player_name_clean) # Reset timers as it's an action
+             # If rotation was active but this wasn't the expected host, clear rotation state
+             if rotating_flag_was_true and player_name_clean != expected_host_at_entry:
+                  log.warning(f"Host re-confirmed '{player_name_clean}', but expected host was '{expected_host_at_entry}'. Clearing rotation state.")
                   self.is_rotating_host = False
                   self._expected_next_host = None
                   self._rotation_start_time = 0
-                  self.display_host_queue() # Display queue anyway as rotation sequence finished
+             return # Exit early, no queue sync needed for re-confirmation
 
-             return # Exit early, no further sync needed
-
-        # --- Host is genuinely changing to someone new (or confirming after assignment) ---
-        previous_host = self.current_host
+        # --- Host is genuinely changing to someone new (potentially incorrect) ---
+        log.info(f"Processing host change to a new player: '{player_name_clean}'. Previous: '{previous_host}'")
         self.current_host = player_name_clean # Update internal host state FIRST
         self.HostChanged.emit({'player': player_name_clean, 'previous': previous_host})
 
         # Ensure player is in lobby list
         if player_name_clean not in self.players_in_lobby:
              log.warning(f"New host '{player_name_clean}' wasn't in player list, adding.")
-             self.handle_player_join(player_name_clean)
+             self.handle_player_join(player_name_clean) # This adds to queue if rotation on
 
         # Reset timers, violations for the NEW confirmed host
         self.reset_host_timers_and_state(player_name_clean)
 
         # Clear vote skip targeting previous host
         if self.vote_skip_active and self.vote_skip_target == previous_host:
+             # ... (vote skip clearing logic remains the same) ...
              log.info(f"Cancelling vote skip for {previous_host} (host changed).")
              self.send_message(f"Host changed to {player_name_clean}. Cancelling vote skip for {previous_host}.")
              self.clear_vote_skip("host changed")
@@ -1128,17 +1194,38 @@ class OsuRoomBot(irc.client.SimpleIRCClient):
              self.send_message(f"Host manually set to {player_name_clean}. Cancelling pending vote skip.")
              self.clear_vote_skip("host changed to target")
 
-        # Synchronize host queue if rotation is enabled
+        # --- Check 3: Manual Host Change Verification (Core of Fix 2) ---
         hr_enabled = self.runtime_config['host_rotation']['enabled']
+        if hr_enabled and self.host_queue:
+            correct_host_in_queue = self.host_queue[0]
+            # If the new host confirmed by Bancho is NOT the person at the front of the queue...
+            if player_name_clean != correct_host_in_queue:
+                log.warning(f"Manual host change detected to '{player_name_clean}', but '{correct_host_in_queue}' is next in queue. Correcting.")
+                self.send_message(f"Incorrect host change detected. Host should be {correct_host_in_queue} based on the queue. Reassigning...")
+                # Issue command to fix it
+                self.send_message(f"!mp host {correct_host_in_queue}")
+                # Tentatively update internal state to the *correct* host
+                self.current_host = correct_host_in_queue
+                # Set rotation flags to wait for Bancho's confirmation of the *correction*
+                self.is_rotating_host = True
+                self._expected_next_host = correct_host_in_queue
+                self._rotation_start_time = time.time()
+                log.debug(f"Corrective '!mp host {correct_host_in_queue}' sent. Waiting for confirmation.")
+                # Do NOT proceed with queue sync logic below, as we're correcting
+                return # Exit early after initiating correction
+
+        # --- If we reach here: Host change was valid or rotation is off ---
+
+        # Synchronize host queue if rotation is enabled (and no correction was needed)
         queue_changed_during_sync = False
         if hr_enabled:
-            log.info(f"Synchronizing queue with new host '{player_name_clean}'. Current Queue: {list(self.host_queue)}")
+            log.debug(f"Synchronizing queue with new host '{player_name_clean}'. Current Queue: {list(self.host_queue)}")
             if player_name_clean not in self.host_queue:
                 log.info(f"New host '{player_name_clean}' wasn't in queue, adding to front.")
                 self.host_queue.appendleft(player_name_clean)
                 queue_changed_during_sync = True
-            elif self.host_queue and self.host_queue[0] != player_name_clean: # Check if queue not empty
-                log.warning(f"Host changed to '{player_name_clean}', but they weren't front of queue. Moving to front.")
+            elif self.host_queue and self.host_queue[0] != player_name_clean: # Already checked they are different above
+                log.info(f"New host '{player_name_clean}' was in queue but not at front. Moving to front.")
                 try:
                     self.host_queue.remove(player_name_clean)
                     self.host_queue.appendleft(player_name_clean)
@@ -1148,28 +1235,21 @@ class OsuRoomBot(irc.client.SimpleIRCClient):
                 log.info(f"Queue was empty, adding new host '{player_name_clean}' to front.")
                 self.host_queue.appendleft(player_name_clean)
                 queue_changed_during_sync = True
-            else: log.info(f"New host '{player_name_clean}' is already front of queue.")
+            # else: New host is already front of queue (this case handled by re-confirmation check earlier)
 
-            # Display queue if it changed OR if rotation was flagged at the start
-            # This ensures queue is shown after successful rotation confirmation
-            if queue_changed_during_sync or rotating_flag_was_true:
-                log.info(f"Queue updated/rotation confirmation. New Queue: {list(self.host_queue)}")
+            # Display queue if it changed
+            if queue_changed_during_sync:
+                log.info(f"Queue updated. New Queue: {list(self.host_queue)}")
                 self.display_host_queue()
 
-        # <<< Check if this host change completes the expected rotation sequence >>>
-        if rotating_flag_was_true and player_name_clean == self._expected_next_host:
-            log.debug(f"Confirmed expected host '{player_name_clean}' after rotation completed. Resuming AFK checks.")
-            self.is_rotating_host = False
-            self._expected_next_host = None
-            self._rotation_start_time = 0
-        elif rotating_flag_was_true:
-             # Host changed, but not to the one we specifically expected from rotation.
-             # This could happen if another player used !mp host manually, or Bancho glitched.
-             # Clear the rotation state anyway to prevent getting stuck.
-             log.warning(f"Host changed to '{player_name_clean}', but expected host from rotation was '{self._expected_next_host}'. Clearing rotation state.")
+        # Clear rotation state if a manual change happened *during* an expected rotation but *not* to the expected person
+        if rotating_flag_was_true and player_name_clean != expected_host_at_entry:
+             log.warning(f"Host manually changed to '{player_name_clean}' while expecting '{expected_host_at_entry}'. Clearing rotation state.")
              self.is_rotating_host = False
              self._expected_next_host = None
              self._rotation_start_time = 0
+             # Display queue again as the manual change interrupted the flow
+             if hr_enabled: self.display_host_queue()
 
     def reset_host_timers_and_state(self, host_name):
         """Resets AFK timer base, violations for the given host."""
@@ -1372,31 +1452,54 @@ class OsuRoomBot(irc.client.SimpleIRCClient):
         self.MatchStarted.emit({'map_id': map_id_at_start}) # Emit the validated map ID
 
     def handle_match_finish(self):
-        # <<< MODIFIED: Added Played History Update >>>
+        """Handles match finish, including corrective host assignment if needed."""
         if self.bot_state != BOT_STATE_IN_ROOM: return
         log.info("Match finished.")
-        self.is_matching = False
+        self.is_matching = False # Update match state first
 
         finished_map_id = self.last_valid_map_id # Map ID that was just completed
-        played_list_config = self.runtime_config.get('maps_played_list', {})
 
-        # Add finished map ID to history if feature enabled and ID is valid
+        # --- START: Corrective Host Assignment Check ---
+        if self._pending_host_after_match is not None:
+            target_host = self._pending_host_after_match
+            log.info(f"Match finished after previous host left. Attempting corrective host assignment to '{target_host}'.")
+            self._pending_host_after_match = None # Consume the flag regardless of outcome
+
+            if target_host and target_host in self.players_in_lobby:
+                log.info(f"Assigning host to '{target_host}' via !mp host.")
+                self.send_message(f"!mp host {target_host}")
+                self.current_host = target_host # Tentatively set internal host
+                # Mark that we are waiting for Bancho confirmation, pauses AFK timer again
+                self.is_rotating_host = True
+                self._expected_next_host = target_host
+                self._rotation_start_time = time.time()
+                self.last_host = None # Clear last host, the temporary host didn't "finish" a turn
+
+                # Add finished map to history (even after corrective assignment)
+                played_list_config = self.runtime_config.get('maps_played_list', {})
+                if played_list_config.get('enabled', False) and finished_map_id > 0:
+                     self._add_map_to_history(finished_map_id)
+
+                self.MatchFinished.emit({'map_id': finished_map_id})
+                self.current_map_id = 0
+                self.current_map_title = ""
+                self.host_map_selected_valid = False
+                # DO NOT proceed to normal rotation logic below
+                log.info(f"Corrective host assignment initiated. Waiting for Bancho confirmation for '{target_host}'.")
+                return # Exit handle_match_finish early
+            else:
+                log.warning(f"Intended host '{target_host}' for corrective assignment is no longer in the lobby or was invalid. Proceeding with normal rotation.")
+                # Fall through to normal logic below
+        # --- END: Corrective Host Assignment Check ---
+
+        # --- Normal Match Finish Logic ---
+        played_list_config = self.runtime_config.get('maps_played_list', {})
         if played_list_config.get('enabled', False) and finished_map_id > 0:
-            try:
-                 map_id_to_add = int(finished_map_id)
-                 # Avoid adding duplicates right after each other if somehow possible? Unlikely with queue logic.
-                 # Check if deque is not empty before accessing last element
-                 if not self.played_maps_history or self.played_maps_history[-1] != map_id_to_add:
-                      self.played_maps_history.append(map_id_to_add)
-                      log.info(f"Added map ID {map_id_to_add} to played history. History: {list(self.played_maps_history)}")
-                 else:
-                      log.debug(f"Map ID {map_id_to_add} is already the last item in history, not adding again.")
-            except (ValueError, TypeError):
-                 log.error(f"Could not add map ID '{finished_map_id}' to played history - invalid type.")
+             self._add_map_to_history(finished_map_id)
         elif finished_map_id <= 0:
             log.warning("Match finished, but last_valid_map_id was 0 or invalid. Cannot add to played history.")
 
-        # Mark the player who was host when the match finished as 'last_host'
+        # Mark the player who was host when the match finished as 'last_host' for rotation
         if self.current_host:
              self.last_host = self.current_host
              log.info(f"Marking '{self.last_host}' as last host after match finish.")
@@ -1404,22 +1507,40 @@ class OsuRoomBot(irc.client.SimpleIRCClient):
              log.warning("Match finished but no current host was tracked? Rotation might be affected.")
              self.last_host = None
 
-        self.MatchFinished.emit({'map_id': finished_map_id}) # Emit the ID of the map that finished
+        self.MatchFinished.emit({'map_id': finished_map_id})
         self.current_map_id = 0 # Clear current map info after finish
         self.current_map_title = ""
         self.host_map_selected_valid = False # Reset flag
-        # Don't clear last_valid_map_id here, it's useful for history
 
         # Trigger host rotation (if enabled) after a short delay
         if self.runtime_config['host_rotation']['enabled']:
             log.info("Scheduling host rotation (1.5s delay) after match finish. Pausing AFK check.")
-            self.is_rotating_host = True # PAUSE AFK CHECK
+            self.is_rotating_host = True # PAUSE AFK CHECK during rotation command/confirmation
+            self._expected_next_host = None # Clear expectation before rotation
+            self._rotation_start_time = 0 # Timer starts when host command sent in rotate_and_set_host
             threading.Timer(1.5, self.rotate_and_set_host).start()
         else:
              # If rotation disabled, just reset timers for the host who finished
              if self.current_host:
                  self.reset_host_timers_and_state(self.current_host)
-
+             # Ensure rotation flag is off if rotation is disabled
+             self.is_rotating_host = False
+             self._expected_next_host = None
+             self._rotation_start_time = 0
+             
+    # Helper function for adding map to history (to avoid duplication)
+    def _add_map_to_history(self, map_id):
+         if map_id <=0: return
+         try:
+             map_id_to_add = int(map_id)
+             if not self.played_maps_history or self.played_maps_history[-1] != map_id_to_add:
+                  self.played_maps_history.append(map_id_to_add)
+                  log.info(f"Added map ID {map_id_to_add} to played history. History: {list(self.played_maps_history)}")
+             else:
+                  log.debug(f"Map ID {map_id_to_add} is already the last item in history, not adding again.")
+         except (ValueError, TypeError):
+             log.error(f"Could not add map ID '{map_id}' to played history - invalid type.")
+             
     def handle_match_abort(self):
         """Handles 'Match Aborted' message from BanchoBot."""
         if self.bot_state != BOT_STATE_IN_ROOM: return
